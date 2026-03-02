@@ -25,7 +25,7 @@ from dashboard import DownloadHistory, DownloadState, start_dashboard
 # ---------------------------------------------------------------------------
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
 logging.basicConfig(format=LOG_FORMAT, level=logging.INFO, stream=sys.stdout)
-log = logging.getLogger("qbit-fetch")
+log = logging.getLogger("qbitpull")
 
 # ---------------------------------------------------------------------------
 # Config
@@ -59,24 +59,24 @@ class Config:
     parallel: int = 4
     # Max consecutive failures before longer backoff
     max_backoff: int = 300
+    # Number of download retries before tagging as error
+    max_retries: int = 3
     # Dashboard web server port (0 = disabled)
     dashboard_port: int = 8686
 
 
-def parse_qbit_host(raw_host: str) -> tuple[str, Optional[str], Optional[str]]:
+def mask_url_credentials(url: str) -> str:
     """
-    Parse QBIT_HOST, stripping embedded credentials if present.
-    Returns (clean_host, user_from_url, pass_from_url).
-    e.g. 'https://user:pass@host/path' -> ('https://host/path', 'user', 'pass')
+    Mask any embedded password in a URL for safe logging.
+    e.g. 'https://user:secret@host/path' -> 'https://user:****@host/path'
     """
-    parsed = urlparse(raw_host)
-    if parsed.username or parsed.password:
-        # Rebuild URL without credentials
-        clean = parsed._replace(
-            netloc=parsed.hostname + (f":{parsed.port}" if parsed.port else "")
-        ).geturl()
-        return clean, parsed.username, parsed.password
-    return raw_host, None, None
+    parsed = urlparse(url)
+    if parsed.password:
+        masked_netloc = f"{parsed.username}:****@{parsed.hostname}"
+        if parsed.port:
+            masked_netloc += f":{parsed.port}"
+        return parsed._replace(netloc=masked_netloc).geturl()
+    return url
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +105,7 @@ class QbitManager:
             password=cfg.qbit_pass,
         )
         self._client.auth_log_in()
-        log.info("qBittorrent connected: %s", cfg.qbit_host)
+        log.info("qBittorrent connected: %s", mask_url_credentials(cfg.qbit_host))
 
     def reconnect(self) -> None:
         """Force a fresh reconnection on next access."""
@@ -517,6 +517,13 @@ def replace_tag(client: qbittorrentapi.Client, torrent_hash: str, old: str, new:
 # ---------------------------------------------------------------------------
 # Main processing
 # ---------------------------------------------------------------------------
+# Track per-torrent retry counts (keyed by torrent hash)
+_retry_counts: dict[str, int] = {}
+# Track torrents already skipped this session (prevents infinite skip loop
+# if the qBittorrent tag update keeps failing)
+_skipped_hashes: set[str] = set()
+
+
 def process_once(qbit_mgr: QbitManager, sftp_mgr: SFTPManager, cfg: Config,
                  history: DownloadHistory = None,
                  dl_state: DownloadState = None) -> int:
@@ -568,14 +575,22 @@ def process_once(qbit_mgr: QbitManager, sftp_mgr: SFTPManager, cfg: Config,
         # Never skip if a .part file exists — that means the previous
         # download was interrupted and needs to be resumed.
         if local_dst.exists() and cfg.skip_if_exists and not has_partial:
+            # If we already tried to skip this torrent and tagging failed,
+            # don't flood the logs or dashboard — just silently move on.
+            if t.hash in _skipped_hashes:
+                continue
             log.info("[SKIP] %s -> '%s' already exists", t.name, local_dst)
             try:
                 replace_tag(qbit, t.hash, cfg.source_tag, cfg.done_tag)
                 log.info("[SKIP] %s -> tagged '%s'", t.name, cfg.done_tag)
+                _skipped_hashes.discard(t.hash)  # clean up on success
+                if history:
+                    history.add_entry(t.name, 0, 0, 0, status="skipped")
             except Exception as e:
                 log.error("Tag update failed for skipped '%s': %s", t.name, e)
-            if history:
-                history.add_entry(t.name, 0, 0, 0, status="skipped")
+                _skipped_hashes.add(t.hash)  # remember so we don't retry every cycle
+                # Force qBit reconnect — stale session is the likely cause
+                qbit_mgr.reconnect()
             continue
         if has_partial:
             log.info("[RESUME] %s -> partial download found, resuming", t.name)
@@ -599,30 +614,42 @@ def process_once(qbit_mgr: QbitManager, sftp_mgr: SFTPManager, cfg: Config,
 
         except Exception as e:
             error_msg = str(e)
-            log.error("Download failed for '%s' (%s): %s", t.name, t.hash, error_msg)
-            # Record failure in dashboard history
-            if history:
-                history.add_entry(t.name, 0, 0, 0, status="failed", error=error_msg)
-            # Tag as error so it doesn't retry every poll cycle
-            try:
-                replace_tag(qbit, t.hash, cfg.source_tag, cfg.error_tag)
-                log.info("[ERR] %s -> tagged '%s'", t.name, cfg.error_tag)
-            except Exception as tag_err:
-                log.error("Could not tag '%s' as error: %s", t.name, tag_err)
+            _retry_counts[t.hash] = _retry_counts.get(t.hash, 0) + 1
+            attempt = _retry_counts[t.hash]
+            log.error("Download failed for '%s' (%s) [attempt %d/%d]: %s",
+                      t.name, t.hash, attempt, cfg.max_retries, error_msg)
             # Force reconnect on next attempt
             sftp_mgr.close()
+            if attempt >= cfg.max_retries:
+                # Max retries reached — tag as error and record failure
+                log.error("[ERR] %s -> giving up after %d attempts", t.name, cfg.max_retries)
+                if history:
+                    history.add_entry(t.name, 0, 0, 0, status="failed",
+                                      error=f"Failed after {cfg.max_retries} attempts: {error_msg}")
+                try:
+                    replace_tag(qbit, t.hash, cfg.source_tag, cfg.error_tag)
+                    log.info("[ERR] %s -> tagged '%s'", t.name, cfg.error_tag)
+                except Exception as tag_err:
+                    log.error("Could not tag '%s' as error: %s", t.name, tag_err)
+                _retry_counts.pop(t.hash, None)
+            else:
+                log.info("[RETRY] %s -> will retry on next poll cycle (%d/%d)",
+                         t.name, attempt, cfg.max_retries)
             continue
 
         try:
             replace_tag(qbit, t.hash, cfg.source_tag, cfg.done_tag)
         except Exception as e:
             log.error("Tag update failed for '%s' (%s): %s", t.name, t.hash, e)
+            qbit_mgr.reconnect()  # stale session — force reconnect
             continue
 
         # Record success in dashboard history
         if history:
             history.add_entry(t.name, dl_bytes, dl_speed, dl_elapsed, status="completed")
 
+        _retry_counts.pop(t.hash, None)   # clear retry counter on success
+        _skipped_hashes.discard(t.hash)  # clear skip tracker on success
         processed += 1
         log.info("[OK] %s -> downloaded and tagged '%s'", t.name, cfg.done_tag)
 
@@ -632,6 +659,16 @@ def process_once(qbit_mgr: QbitManager, sftp_mgr: SFTPManager, cfg: Config,
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+def _safe_int(env_var: str, default: int) -> int:
+    """Safely parse an integer from an environment variable."""
+    raw = os.environ.get(env_var, str(default))
+    try:
+        return int(raw)
+    except ValueError:
+        log.warning("Invalid value for %s: '%s' — using default %d", env_var, raw, default)
+        return default
+
+
 def main() -> int:
     # Handle SIGTERM for clean Docker shutdown
     signal.signal(signal.SIGTERM, lambda sig, frame: sys.exit(0))
@@ -649,21 +686,21 @@ def main() -> int:
         error_tag=os.environ.get("ERROR_TAG", "error"),
         # SFTP
         sftp_host=os.environ.get("SFTP_HOST", "127.0.0.1"),
-        sftp_port=int(os.environ.get("SFTP_PORT", "22")),
+        sftp_port=_safe_int("SFTP_PORT", 22),
         sftp_user=os.environ.get("SFTP_USER", "user"),
         sftp_pass=os.environ.get("SFTP_PASS") or None,
         sftp_key_path=os.environ.get("SFTP_KEY") or None,
         sftp_key_passphrase=os.environ.get("SFTP_KEY_PASSPHRASE") or None,
         # Local
         local_dir=Path(os.environ.get("LOCAL_DIR", "./downloads_from_remote")),
-        poll_seconds=int(os.environ.get("POLL_SECONDS", "30")),
+        poll_seconds=_safe_int("POLL_SECONDS", 30),
         skip_if_exists=os.environ.get("SKIP_IF_EXISTS", "1") != "0",
-        ssh_keepalive=int(os.environ.get("SSH_KEEPALIVE", "15")),
-        parallel=int(os.environ.get("LFTP_PARALLEL", "4")),
-        dashboard_port=int(os.environ.get("DASHBOARD_PORT", "8686")),
+        ssh_keepalive=_safe_int("SSH_KEEPALIVE", 15),
+        parallel=_safe_int("LFTP_PARALLEL", 4),
+        dashboard_port=_safe_int("DASHBOARD_PORT", 8686),
     )
 
-    log.info("QBIT_HOST: %s", cfg.qbit_host)
+    log.info("QBIT_HOST: %s", mask_url_credentials(cfg.qbit_host))
 
     cfg.local_dir.mkdir(parents=True, exist_ok=True)
     if not os.access(cfg.local_dir, os.W_OK):
@@ -686,13 +723,15 @@ def main() -> int:
         log.critical("Could not connect via SFTP: %s", e)
         return 3
 
-    log.info("Connected to qBittorrent: %s", cfg.qbit_host)
+    log.info("Connected to qBittorrent: %s", mask_url_credentials(cfg.qbit_host))
     log.info("Connected via SFTP: %s@%s:%d", cfg.sftp_user, cfg.sftp_host, cfg.sftp_port)
     log.info("Watching tag '%s' -> download to '%s' -> retag '%s'", cfg.source_tag, cfg.local_dir, cfg.done_tag)
     log.info("SSH keep-alive: %ds | Poll interval: %ds", cfg.ssh_keepalive, cfg.poll_seconds)
 
     # --- Download history + state + web dashboard ---
-    history = DownloadHistory(cfg.local_dir / ".qbitfetch_history.json")
+    history_dir = cfg.local_dir / ".qbitpull"
+    history_dir.mkdir(parents=True, exist_ok=True)
+    history = DownloadHistory(history_dir / "history.json")
     dl_state = DownloadState()
     if cfg.dashboard_port > 0:
         try:

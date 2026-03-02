@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-QbitFetch Dashboard — Lightweight web UI for viewing download history
+QbitPull Dashboard — Lightweight web UI for viewing download history
 and controlling active downloads. Uses Python stdlib only.
 """
 from __future__ import annotations
@@ -14,7 +14,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
-log = logging.getLogger("qbit-fetch")
+log = logging.getLogger("qbitpull")
 
 # ---------------------------------------------------------------------------
 # Download history — thread-safe JSON storage
@@ -261,7 +261,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>QbitFetch Dashboard</title>
+<title>QbitPull Dashboard</title>
 <style>
   :root {
     --bg-primary: #0f1117;
@@ -532,7 +532,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 </head>
 <body>
   <div class="header">
-    <h1><img class="logo" src="/icon.png" alt="QbitFetch">Qbit<span>Fetch</span></h1>
+    <h1><img class="logo" src="/icon.png" alt="QbitPull">Qbit<span>Pull</span></h1>
     <span class="status"><span class="dot"></span>Monitoring</span>
   </div>
 
@@ -741,7 +741,7 @@ setInterval(refresh, 5000);
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
-    """HTTP handler for the QbitFetch dashboard."""
+    """HTTP handler for the QbitPull dashboard."""
 
     def do_GET(self):
         parsed = urlparse(self.path)
