@@ -555,8 +555,13 @@ def process_once(qbit_mgr: QbitManager, sftp_mgr: SFTPManager, cfg: Config,
         # Check for .part file (in-progress download from previous attempt).
         # If a .part file exists, the download was interrupted — don't skip,
         # let lftp resume it.
-        part_file = local_dst.with_name(local_dst.name + PART_SUFFIX)
-        has_partial = part_file.exists()
+        has_partial = False
+        if is_dir and local_dst.is_dir():
+            # For directories, check if any .part files exist inside
+            has_partial = any(local_dst.rglob("*" + PART_SUFFIX))
+        else:
+            part_file = local_dst.with_name(local_dst.name + PART_SUFFIX)
+            has_partial = part_file.exists()
 
         # Skip check: for dirs, check if the dir exists; for single files,
         # check if the actual file exists inside the wrapper folder.
