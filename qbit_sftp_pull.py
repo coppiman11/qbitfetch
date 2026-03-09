@@ -729,7 +729,8 @@ def main() -> int:
     log.info("SSH keep-alive: %ds | Poll interval: %ds", cfg.ssh_keepalive, cfg.poll_seconds)
 
     # --- Download history + state + web dashboard ---
-    history_dir = cfg.local_dir / ".qbitpull"
+    # Store history inside the container (not on the host volume)
+    history_dir = Path("/app/.qbitpull")
     history_dir.mkdir(parents=True, exist_ok=True)
     history = DownloadHistory(history_dir / "history.json")
     dl_state = DownloadState()
